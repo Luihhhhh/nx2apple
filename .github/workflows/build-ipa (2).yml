@@ -29,6 +29,15 @@ jobs:
         run: |
           export LC_ALL=C
           export LANG=C
+          python3 - << 'EOF'
+          import glob
+          for path in glob.glob("dm/ios/**/*.swift", recursive=True):
+              txt = open(path, "r", encoding="utf-8").read()
+              new_txt = txt.replace(".glassProminent", ".borderedProminent").replace(".buttonStyle(.glass)", ".buttonStyle(.bordered)")
+              if new_txt != txt:
+                  open(path, "w", encoding="utf-8").write(new_txt)
+                  print(f"Parchado para compatibilidad Xcode/iOS SDK: {path}")
+          EOF
           brew install xcodegen zstd spirv-cross python@3.12
           brew install --cask dotnet-sdk
           sudo xcodebuild -license accept || true
@@ -130,10 +139,25 @@ jobs:
             IDX_DIR=$(dirname "$EXISTING_IDX")
             mv "$IDX_DIR"/romfs.* "$RUNNER_TEMP/out_romfs/romfs/"
           else
-            ROMFS_DIR=$(find "$RUNNER_TEMP/game" -type d \( -name "romfs" -o -name "RomFS" \) | head -n 1)
-            if [ -z "$ROMFS_DIR" ]; then
-              ROMFS_DIR=$(find "$RUNNER_TEMP/game" -type d \( -name "*-work" -o -name "*_build" \) | head -n 1)/romfs
-            fi
+            ROMFS_DIR=$(python3 - "$RUNNER_TEMP/game" << 'EOF'
+          import os, sys
+          root = sys.argv[1]
+          candidates = []
+          for dirpath, dirnames, filenames in os.walk(root):
+              base = os.path.basename(dirpath).lower()
+              if base in ("romfs", "rom", "content") and (dirnames or filenames):
+                  candidates.append(dirpath)
+          if candidates:
+              candidates.sort(key=lambda p: len(p))
+              print(candidates[0])
+              sys.exit(0)
+          for dirpath, dirnames, filenames in os.walk(root):
+              if os.path.basename(os.path.dirname(dirpath)) == "extract" and len(dirnames) > 0:
+                  print(dirpath)
+                  sys.exit(0)
+          print("")
+          EOF
+            )
             python3 dm/tools/romfs_arc.py pack "$ROMFS_DIR" "$RUNNER_TEMP/out_romfs/romfs/romfs" --shard-mib 200
             python3 dm/tools/romfs_arc.py verify "$RUNNER_TEMP/out_romfs/romfs/romfs" "$ROMFS_DIR"
             rm -rf "$ROMFS_DIR" || true
@@ -158,4 +182,3 @@ jobs:
           name: Switch-Game-RomFS-Shards
           path: ${{ runner.temp }}/out_romfs/romfs/*
           retention-days: 5
-
