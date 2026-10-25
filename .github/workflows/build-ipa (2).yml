@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       base_game_url:
-        description: 'URL de descarga directa de tu juego base (.xci o .nsp)'
+        description: 'URL de tu juego base (.xci o .nsp)'
         required: true
         type: string
       update_nsp_url:
-        description: 'URL de descarga directa del Update (.nsp o .xci) requerido (opcional si ya viene en el XCI)'
+        description: 'URL del Update (.nsp o .xci) requerido (opcional si ya viene en el XCI)'
         required: false
         type: string
       keys_url:
-        description: 'URL de descarga directa de tu archivo prod.keys'
+        description: 'URL de tu archivo prod.keys'
         required: true
         type: string
 
@@ -22,104 +22,140 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - name: Clonar repositorio NX2Apple
+      - name: 1. Clonar repositorio NX2Apple
         uses: actions/checkout@v4
 
-      - name: Instalar dependencias (Homebrew, .NET, Python y 4NXCI)
+      - name: 2. Instalar dependencias (Xcode, .NET 10, Python 3.12 y 4NXCI)
         run: |
-          brew install xcodegen zstd spirv-cross
+          export LC_ALL=C
+          export LANG=C
+          brew install xcodegen zstd spirv-cross python@3.12
           brew install --cask dotnet-sdk
+          sudo xcodebuild -license accept || true
           sudo xcodebuild -runFirstLaunch || true
-
-          # Instalar paquetes en Python de Homebrew (con --break-system-packages por PEP 668) y en Python del sistema
-          python3 -m pip install --break-system-packages lz4 capstone fonttools
+          export DOTNET_ROOT="/usr/local/share/dotnet"
+          sudo ln -sf /usr/local/share/dotnet /opt/homebrew/share/dotnet || true
+          export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:/usr/local/share/dotnet:/opt/homebrew/bin:$PATH"
+          /opt/homebrew/opt/python@3.12/libexec/bin/python3 -m pip install --break-system-packages lz4 capstone fonttools backports.zstd
+          python3 -m pip install --break-system-packages lz4 capstone fonttools || true
           python3 -m pip install --break-system-packages backports.zstd || true
           /usr/bin/python3 -m pip install --user lz4 capstone fonttools backports.zstd || true
-
-          # Compilar 4NXCI para convertir archivos .xci a .nsp automaticamente
-          git clone https://github.com/tetj/4NXCI-2026.git "$RUNNER_TEMP/4nxci_src" || git clone https://github.com/tiliarou/4NXCI.git "$RUNNER_TEMP/4nxci_src"
+          git clone https://github.com/tiliarou/4NXCI.git "$RUNNER_TEMP/4nxci_src" || git clone https://github.com/tetj/4NXCI-2026.git "$RUNNER_TEMP/4nxci_src"
           cd "$RUNNER_TEMP/4nxci_src"
           cp config.mk.template config.mk
-          make CC=clang CFLAGS="-O2 -Wno-error -Wno-deprecated-declarations -Wno-implicit-function-declaration" -j4 || make -j4
+          make CC=clang CFLAGS="-O2 -Wno-error -Wno-deprecated-declarations -Wno-implicit-function-declaration -Wno-int-conversion" -j4 || make CC=clang -j4
 
-      - name: Descargar prod.keys y juego (.xci o .nsp)
+      - name: 3. Descargar prod.keys y convertir juego (.xci / .nsp)
         env:
-          BASE_URL: ${{ inputs.base_game_url }}
-          UPDATE_URL: ${{ inputs.update_nsp_url }}
-          KEYS_URL: ${{ inputs.keys_url }}
+          RAW_BASE_URL: ${{ inputs.base_game_url }}
+          RAW_UPDATE_URL: ${{ inputs.update_nsp_url }}
+          RAW_KEYS_URL: ${{ inputs.keys_url }}
         run: |
+          export LC_ALL=C
+          export LANG=C
+          export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:/usr/local/share/dotnet:/opt/homebrew/bin:$PATH"
+          BASE_URL=$(python3 -c 'import os; u=os.environ.get("RAW_BASE_URL","").strip(); print(u.replace("/blob/","/resolve/"))')
+          UPDATE_URL=$(python3 -c 'import os; u=os.environ.get("RAW_UPDATE_URL","").strip(); print(u.replace("/blob/","/resolve/"))')
+          KEYS_URL=$(python3 -c 'import os; u=os.environ.get("RAW_KEYS_URL","").strip(); print(u.replace("/blob/","/resolve/"))')
           mkdir -p "$RUNNER_TEMP/keys" "$RUNNER_TEMP/raw" "$RUNNER_TEMP/game" "$RUNNER_TEMP/out_romfs/romfs" ~/.switch
-          curl -L --fail "$KEYS_URL" -o "$RUNNER_TEMP/keys/prod.keys"
-          # Limpiar posibles lineas corruptas que bloquean nx_extract o 4nxci
-          sed -i '' '/master_kek_source_/d' "$RUNNER_TEMP/keys/prod.keys" || true
+          curl -L --fail --retry 3 "$KEYS_URL" -o "$RUNNER_TEMP/keys/prod.keys"
+          python3 - "$RUNNER_TEMP/keys/prod.keys" << 'EOF'
+          import sys
+          p = sys.argv[1]
+          data = open(p, "rb").read()
+          if b"<html" in data[:512].lower() or b"<!doctype" in data[:512].lower():
+              sys.exit("ERROR: El enlace de prod.keys descargo una pagina HTML en vez del archivo.")
+          lines = data.replace(b"\r\n", b"\n").splitlines()
+          clean = [l.strip() for l in lines if l.strip() and b"master_kek_source_" not in l]
+          open(p, "wb").write(b"\n".join(clean) + b"\n")
+          print(f"prod.keys listo ({len(clean)} claves validas).")
+          EOF
           cp "$RUNNER_TEMP/keys/prod.keys" ~/.switch/prod.keys
           cp "$RUNNER_TEMP/keys/prod.keys" "$RUNNER_TEMP/4nxci_src/keys.dat"
-
-          echo "Descargando archivo principal del juego..."
-          curl -L --fail "$BASE_URL" -o "$RUNNER_TEMP/raw/base_download"
-
-          # Detectar automaticamente si el archivo descargado es NSP (empieza con PFS0) o XCI
-          MAGIC=$(head -c 4 "$RUNNER_TEMP/raw/base_download" | tr -d '\0')
-          if [ "$MAGIC" = "PFS0" ]; then
-            echo "Archivo detectado como NSP directo."
+          curl -L --fail --retry 3 "$BASE_URL" -o "$RUNNER_TEMP/raw/base_download"
+          FMT=$(python3 - "$RUNNER_TEMP/raw/base_download" << 'EOF'
+          import sys
+          f = open(sys.argv[1], "rb")
+          head = f.read(512)
+          if b"<html" in head.lower() or b"<!doctype" in head.lower():
+              sys.exit("ERROR: El enlace del juego descargo una pagina HTML en vez del archivo.")
+          print("NSP" if head[:4] == b"PFS0" else "XCI")
+          EOF
+          )
+          if [ "$FMT" = "NSP" ]; then
             mv "$RUNNER_TEMP/raw/base_download" "$RUNNER_TEMP/game/base.nsp"
           else
-            echo "Archivo detectado como XCI. Convirtiendo a NSP con 4NXCI..."
             mv "$RUNNER_TEMP/raw/base_download" "$RUNNER_TEMP/raw/base.xci"
             mkdir -p "$RUNNER_TEMP/raw/tmp_xci"
-            "$RUNNER_TEMP/4nxci_src/4nxci" -k "$RUNNER_TEMP/keys/prod.keys" -o "$RUNNER_TEMP/game" -t "$RUNNER_TEMP/raw/tmp_xci" "$RUNNER_TEMP/raw/base.xci"
-            rm -rf "$RUNNER_TEMP/raw/base.xci" "$RUNNER_TEMP/raw/tmp_xci"
+            if "$RUNNER_TEMP/4nxci_src/4nxci" -k "$RUNNER_TEMP/keys/prod.keys" -o "$RUNNER_TEMP/game" -t "$RUNNER_TEMP/raw/tmp_xci" "$RUNNER_TEMP/raw/base.xci"; then
+              find "$RUNNER_TEMP/game" -mindepth 2 -name "*.nsp" -exec mv {} "$RUNNER_TEMP/game/" \; || true
+              rm -rf "$RUNNER_TEMP/raw/base.xci" "$RUNNER_TEMP/raw/tmp_xci"
+            else
+              rm -rf "$RUNNER_TEMP/raw/tmp_xci"
+              mv "$RUNNER_TEMP/raw/base.xci" "$RUNNER_TEMP/game/base.xci"
+            fi
           fi
-
           if [ -n "$UPDATE_URL" ]; then
-            echo "Descargando archivo de actualizacion (Update)..."
-            curl -L --fail "$UPDATE_URL" -o "$RUNNER_TEMP/raw/update_download"
-            UMAGIC=$(head -c 4 "$RUNNER_TEMP/raw/update_download" | tr -d '\0')
-            if [ "$UMAGIC" = "PFS0" ]; then
+            curl -L --fail --retry 3 "$UPDATE_URL" -o "$RUNNER_TEMP/raw/update_download"
+            UFMT=$(python3 -c "import sys; h=open(sys.argv[1],'rb').read(4); print('NSP' if h==b'PFS0' else 'XCI')" "$RUNNER_TEMP/raw/update_download")
+            if [ "$UFMT" = "NSP" ]; then
               mv "$RUNNER_TEMP/raw/update_download" "$RUNNER_TEMP/game/update.nsp"
             else
               mv "$RUNNER_TEMP/raw/update_download" "$RUNNER_TEMP/raw/update.xci"
               mkdir -p "$RUNNER_TEMP/raw/tmp_uxci"
-              "$RUNNER_TEMP/4nxci_src/4nxci" -k "$RUNNER_TEMP/keys/prod.keys" -o "$RUNNER_TEMP/game" -t "$RUNNER_TEMP/raw/tmp_uxci" "$RUNNER_TEMP/raw/update.xci"
+              "$RUNNER_TEMP/4nxci_src/4nxci" -k "$RUNNER_TEMP/keys/prod.keys" -o "$RUNNER_TEMP/game" -t "$RUNNER_TEMP/raw/tmp_uxci" "$RUNNER_TEMP/raw/update.xci" || mv "$RUNNER_TEMP/raw/update.xci" "$RUNNER_TEMP/game/update.xci"
+              find "$RUNNER_TEMP/game" -mindepth 2 -name "*.nsp" -exec mv {} "$RUNNER_TEMP/game/" \; || true
               rm -rf "$RUNNER_TEMP/raw/update.xci" "$RUNNER_TEMP/raw/tmp_uxci"
             fi
           fi
-
-          echo "Archivos NSP listos para NX2Apple:"
+          rm -rf "$RUNNER_TEMP/raw"
           ls -lh "$RUNNER_TEMP/game"
 
-      - name: Ejecutar pipeline de NX2Apple (Unpack, Rewrite, Shaders, Slim IPA)
+      - name: 4. Ejecutar NX2Apple (Extraer, Reescribir ARM64, Shaders Metal y crear Slim IPA)
         run: |
+          export LC_ALL=C
+          export LANG=C
           export DOTNET_ROOT="/usr/local/share/dotnet"
-          export PATH="/opt/homebrew/bin:$DOTNET_ROOT:$PATH"
+          export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:/usr/local/share/dotnet:/opt/homebrew/bin:$PATH"
           python3 scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" -k "$RUNNER_TEMP/keys/prod.keys"
+          rm -f "$RUNNER_TEMP/game"/*.nsp "$RUNNER_TEMP/game"/*.xci || true
 
-      - name: Empaquetar y verificar el archivo fragmentado RomFS (200 MiB shards)
+      - name: 5. Empaquetar y verificar fragmentos RomFS (200 MiB shards)
         run: |
-          ROMFS_DIR=$(find "$RUNNER_TEMP/game" -type d \( -name "romfs" -o -name "RomFS" \) | head -n 1)
-          if [ -z "$ROMFS_DIR" ]; then
-            ROMFS_DIR=$(find "$RUNNER_TEMP/game" -type d -name "*-work" | head -n 1)/romfs
+          export LC_ALL=C
+          export LANG=C
+          export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:/usr/local/share/dotnet:/opt/homebrew/bin:$PATH"
+          EXISTING_IDX=$(find "$RUNNER_TEMP/game" -name "romfs.idx" | head -n 1)
+          if [ -n "$EXISTING_IDX" ]; then
+            IDX_DIR=$(dirname "$EXISTING_IDX")
+            mv "$IDX_DIR"/romfs.* "$RUNNER_TEMP/out_romfs/romfs/"
+          else
+            ROMFS_DIR=$(find "$RUNNER_TEMP/game" -type d \( -name "romfs" -o -name "RomFS" \) | head -n 1)
+            if [ -z "$ROMFS_DIR" ]; then
+              ROMFS_DIR=$(find "$RUNNER_TEMP/game" -type d \( -name "*-work" -o -name "*_build" \) | head -n 1)/romfs
+            fi
+            python3 dm/tools/romfs_arc.py pack "$ROMFS_DIR" "$RUNNER_TEMP/out_romfs/romfs/romfs" --shard-mib 200
+            python3 dm/tools/romfs_arc.py verify "$RUNNER_TEMP/out_romfs/romfs/romfs" "$ROMFS_DIR"
+            rm -rf "$ROMFS_DIR" || true
           fi
-          echo "Empaquetando RomFS desde: $ROMFS_DIR"
-          python3 dm/tools/romfs_arc.py pack "$ROMFS_DIR" "$RUNNER_TEMP/out_romfs/romfs/romfs" --shard-mib 200
-          python3 dm/tools/romfs_arc.py verify "$RUNNER_TEMP/out_romfs/romfs/romfs" "$ROM_DIR" || python3 dm/tools/romfs_arc.py verify "$RUNNER_TEMP/out_romfs/romfs/romfs" "$ROMFS_DIR"
 
-      - name: Recolectar archivo IPA generado
+      - name: 6. Preparar archivos finales para descarga
         run: |
           mkdir -p "$RUNNER_TEMP/out_ipa"
-          find "$RUNNER_TEMP/game" -name "*.ipa" -exec cp {} "$RUNNER_TEMP/out_ipa/" \;
+          find "$RUNNER_TEMP/game" -name "*.ipa" -exec mv {} "$RUNNER_TEMP/out_ipa/" \;
           ls -lh "$RUNNER_TEMP/out_ipa" "$RUNNER_TEMP/out_romfs/romfs"
 
-      - name: Subir IPA ligero listo para instalar
+      - name: 7. Subir IPA ligero listo para instalar
         uses: actions/upload-artifact@v4
         with:
           name: Switch-Game-Slim-IPA
           path: ${{ runner.temp }}/out_ipa/*.ipa
           retention-days: 5
 
-      - name: Subir fragmentos RomFS (carpeta romfs/)
+      - name: 8. Subir fragmentos RomFS (carpeta romfs/)
         uses: actions/upload-artifact@v4
         with:
           name: Switch-Game-RomFS-Shards
           path: ${{ runner.temp }}/out_romfs/romfs/*
           retention-days: 5
+
