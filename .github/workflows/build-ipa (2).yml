@@ -29,14 +29,32 @@ jobs:
         run: |
           export LC_ALL=C
           export LANG=C
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$LATEST_XCODE" ]; then
+            sudo xcode-select -s "$LATEST_XCODE" || true
+          fi
           python3 - << 'EOF'
-          import glob
-          for path in glob.glob("dm/ios/**/*.swift", recursive=True):
-              txt = open(path, "r", encoding="utf-8").read()
-              new_txt = txt.replace(".glassProminent", ".borderedProminent").replace(".buttonStyle(.glass)", ".buttonStyle(.bordered)")
-              if new_txt != txt:
-                  open(path, "w", encoding="utf-8").write(new_txt)
-                  print(f"Parchado para compatibilidad Xcode/iOS SDK: {path}")
+          import os
+          for root_dir in ("dm", "scripts"):
+              if not os.path.exists(root_dir):
+                  continue
+              for dirpath, _, filenames in os.walk(root_dir):
+                  for fn in filenames:
+                      if fn.endswith((".swift", ".c", ".m", ".h", ".sh", ".py", ".yml", ".yaml", "Makefile", ".mk", ".pbxproj")):
+                          p = os.path.join(dirpath, fn)
+                          try:
+                              txt = open(p, "r", encoding="utf-8", errors="ignore").read()
+                          except Exception:
+                              continue
+                          new_txt = (
+                              txt.replace(".glassProminent", ".borderedProminent")
+                                 .replace(".buttonStyle(.glass)", ".buttonStyle(.bordered)")
+                                 .replace("apple-a18", "apple-a17")
+                                 .replace("apple-m4", "apple-m2")
+                          )
+                          if new_txt != txt:
+                              open(p, "w", encoding="utf-8").write(new_txt)
+                              print(f"Parchado para compatibilidad con Xcode 16: {p}")
           EOF
           brew install xcodegen zstd spirv-cross python@3.12
           brew install --cask dotnet-sdk
